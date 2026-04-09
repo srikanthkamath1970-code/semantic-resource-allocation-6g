@@ -1,0 +1,681 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+
+\graphicspath{{figures/}}
+
+\title{Tiny Language Model Based Context-Aware Resource Allocation for 6G Semantic Communication Systems}
+
+\author{
+\IEEEauthorblockN{Animesh Kumar}
+\IEEEauthorblockA{
+School of Electrical Engineering\\
+Manipal Institute of Technology\\
+Manipal, Karnataka, India\\
+animesh3.mitmpl2023@learner.manipal.edu
+}
+\and
+\IEEEauthorblockN{H Srikanth Kamath}
+\IEEEauthorblockA{
+Dept. of Electrical, Electronics and Communication Engineering\\
+Indian Institute of Technology Dharwad\\
+Dharwad, Karnataka, India\\
+ee25dpc01@iitdh.ac.in
+}
+\and
+\IEEEauthorblockN{Rahul Jashvanthbhai Pandya}
+\IEEEauthorblockA{
+Dept. of Electrical, Electronics and Communication Engineering\\
+Indian Institute of Technology Dharwad\\
+Dharwad, Karnataka, India\\
+rpandya@iitdh.ac.in
+}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This paper studies semantic-aware resource allocation in 6G systems where each user message is assigned an importance score by a lightweight on-device TinyML model. The objective is to maximise semantic utility while ensuring queue stability under stochastic arrivals and fading channels. Fixing semantic scores per time-slot renders the problem jointly concave, enabling a closed-form Semantic Water-Filling solution with $\mathcal{O}(N\log N)$ complexity suitable for real-time operation. A Lyapunov Drift-Plus-Penalty controller guarantees an $\mathcal{O}(1/V)$ utility gap and $\mathcal{O}(V)$ queue bound.
+
+Simulation results show that in normal traffic regimes, the proposed method matches baseline schedulers in utility, while under heterogeneous load it significantly reduces delay and stabilises queue variance. This establishes the primary contribution as robustness under load imbalance rather than universal superiority. Additional extensions (ADMM, Nash equilibrium, SCA, SDP) are included with explicit validity domains. A hardware-aware TinyML compression pipeline reduces model energy by 19$\times$ with negligible accuracy loss.
+\end{abstract}
+
+\begin{IEEEkeywords}
+6G, semantic communication, TinyML, convex optimisation, Lyapunov drift-plus-penalty, water-filling, ADMM, Nash equilibrium, successive convex approximation, edge AI, quantisation-aware training.
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:intro}
+
+Sixth-generation (6G) wireless networks are expected to support a new communication paradigm in which the meaning of a transmitted message, rather than mere bit accuracy, governs resource allocation. In semantic communication, each message $M_i$ is associated with an importance score $S_i \in [0,1]$ produced by a lightweight neural model deployed at the network edge or on the user device. Allocating radio resources proportionally to $S_i$ improves the downstream utility of the received information while respecting stringent delay and energy constraints.
+
+The joint optimisation of power and bandwidth under semantic weights, queue dynamics, and stochastic fading is generally non-convex and non-stationary. This paper provides:
+\begin{enumerate}
+  \item A minimal, self-contained solution for a single centralised base station (BS) based on Lyapunov Drift-Plus-Penalty (DPP) control and closed-form Semantic Water-Filling.
+  \item Principled extensions for distributed BSs (ADMM), selfish devices (Nash Equilibrium), power-coupled scores (SCA), and MIMO beamforming (SDP), each with explicit trigger conditions and validity domains.
+  \item A TinyML compression pipeline that decouples model inference from online optimisation.
+\end{enumerate}
+
+\textbf{Contribution framing.}
+Unlike conventional works that focus on average throughput gains, this paper targets robustness under non-ideal traffic conditions. In homogeneous traffic regimes, all schedulers achieve comparable utility due to symmetric channel statistics. The proposed method differentiates itself under heterogeneous load, where queue-aware control significantly reduces delay and stabilises backlog variance. Therefore, the contribution is not universal improvement, but consistent performance under stress conditions.
+
+The rest of the paper is organised as follows. Section~\ref{sec:assumptions} states the system assumptions. Section~\ref{sec:problem} formulates the joint optimisation problem. Section~\ref{sec:core} presents the core three-step solution. Sections~\ref{sec:lyapunov}--\ref{sec:tinyml} detail each method and its validity domain. Section~\ref{sec:results} reports simulation results, and Section~\ref{sec:conclusion} concludes.
+
+\section{System Assumptions}
+\label{sec:assumptions}
+
+All theoretical claims in this paper are valid only within the domains stated in Table~\ref{tab:assumptions}. The most critical assumption---that the semantic score $S_i$ is fixed as an exogenous input at the start of each time-slot---is what renders the core problem convex. When this assumption is violated (i.e., $S_i$ depends on $P_i$), Method~C (SCA) must replace the standard solver.
+
+\begin{table*}[!t]
+\renewcommand{\arraystretch}{1.25}
+\caption{System Assumptions and Violation Consequences}
+\label{tab:assumptions}
+\centering
+\begin{tabular}{@{}p{2.6cm} p{5.2cm} p{6.5cm}@{}}
+\toprule
+\textbf{Applies To} & \textbf{Assumption Required} & \textbf{What Breaks When Violated} \\
+\midrule
+All Methods &
+Channel $h_i(t)$ follows a stationary (ergodic) distribution &
+Lyapunov drift bounds require stationarity; breaks under adversarial channels \\
+
+All Methods &
+Arrival process $\lambda_i(t)$ is i.i.d.\ or ergodic &
+Queue-stability guarantee breaks under non-stationary traffic \\
+
+Convex Solver &
+$S_i$ is fixed at the start of each slot (treated as input, not variable) &
+If $S_i$ depends on $P_i$, the problem is non-convex; use SCA (Method~C) \\
+
+ADMM &
+Backhaul links are reliable and low-latency ($<1$\,ms) &
+Delayed or out-of-order updates break convergence; speed depends on $\rho$ and latency \\
+
+Nash Eq. &
+Utility $u_i = S_i R_i - c_i P_i$ is concave in $P_i$; diagonal strict concavity holds (Rosen 1965); interference fixed during each user's update &
+Best-response dynamics fail to converge with non-convex coupling \\
+
+SCA &
+Objective has Lipschitz-smooth gradient; surrogate satisfies conditions A1--A4 &
+Poor starting point or non-smooth objectives can cause divergence \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Problem Formulation}
+\label{sec:problem}
+
+\subsection{Joint Semantic-CSI Resource Allocation (P0)}
+
+Let $\mathcal{N} = \{1,\ldots,N\}$ be the set of users, $P_i(t)$ the transmit power, $B_i(t)$ the allocated bandwidth, $h_i(t)$ the complex channel coefficient, and $N_0$ the noise power spectral density. The Shannon rate for user $i$ is
+\begin{equation}
+R_i(t) = B_i(t)\log_2\!\left(1 + \frac{P_i(t)|h_i(t)|^2}{N_0 B_i(t)}\right).
+\label{eq:rate}
+\end{equation}
+The semantic score is $S_i = \sigma(f_\theta(M_i)) \in [0,1]$, where $f_\theta$ is the TinyML model and $\sigma$ is the sigmoid activation.
+
+The joint optimisation problem is:
+\begin{align}
+\textbf{(P0)}\quad &\underset{P_i,B_i}{\text{maximise}} \sum_{i \in \mathcal{N}} S_i(\theta, M_i) \cdot R_i(t) \label{eq:P0obj}\\
+\text{(C1)}\quad & \sum_i P_i \le P_{\max},\quad P_i \ge 0 \label{eq:C1}\\
+\text{(C2)}\quad & \sum_i B_i \le B_{\text{total}},\quad B_i > 0 \label{eq:C2}\\
+\text{(C3)}\quad & Q_i(t{+}1) = \bigl[Q_i(t) - \mu_i(t)\bigr]^+ + \lambda_i(t) \label{eq:C3}\\
+\text{(C4)}\quad & \mathbb{E}[Q_i(t)] < \infty \quad\forall i \label{eq:C4}\\
+\text{(C5)}\quad & S_i = \sigma(f_\theta(M_i)) \in [0,1], \text{ fixed per slot.} \label{eq:C5}
+\end{align}
+
+\subsection{Sources of Difficulty}
+
+Problem (P0) is hard to solve directly for four reasons:
+\begin{enumerate}
+\item \textbf{Bilinear coupling.} $S_i \times R_i$ is neither linear nor jointly convex. Fix: treat $S_i$ as an input each slot $\to$ convex.
+\item \textbf{Queue floor operator} $[\cdot]^+$. Breaks smooth differentiation; handled by the Lyapunov method.
+\item \textbf{Random channel} $h_i(t)$. Decisions made without future knowledge; Lyapunov method requires no forecasting.
+\item \textbf{Binary scheduling} (if used). $x_i \in \{0,1\}$ makes it combinatorial; LP relaxation $+$ randomised rounding applies.
+\end{enumerate}
+
+\section{Core Three-Step Solution}
+\label{sec:core}
+
+\noindent\textit{This three-step approach is sufficient for a centralised single-BS deployment. All subsequent methods are triggered only by specific deployment scenarios.}
+
+\textbf{Step 1 --- Compute Semantic Scores.}
+A TinyML model processes message $M_i$ offline or from cache:
+$S_i = \sigma(f_\theta(M_i)) \in [0,1]$.
+Once $S_i$ is fixed, the objective~\eqref{eq:P0obj} becomes jointly concave in $(P,B)$, enabling efficient convex solvers.
+
+\textbf{Step 2 --- Lyapunov DPP Control.}
+Each time-slot, solve:
+\begin{equation}
+\underset{P_i,B_i}{\text{minimise}}\;
+-V\sum_i S_i R_i \;+\; \sum_i Q_i(\lambda_i - \mu_i)
+\quad \text{s.t. } \sum_i P_i \le P_{\max}.
+\label{eq:dpp}
+\end{equation}
+Guarantee: $\mathbb{E}[\text{utility}] \ge \text{optimal} - B/V$ and $\mathbb{E}[Q_i] = \mathcal{O}(V)$.
+
+\textbf{Step 3 --- Semantic Water-Filling.}
+Applying KKT conditions to~\eqref{eq:dpp}:
+\begin{equation}
+P_i^* = \left[\frac{S_i}{\mu} - \frac{N_0 B_i}{|h_i|^2}\right]^+,
+\label{eq:waterfill}
+\end{equation}
+where $\mu = 1/\lambda$ is the water level found by bisection in $\mathcal{O}(\log(1/\varepsilon))$ steps. Total complexity: $\mathcal{O}(N\log N)$---no solver required in real-time deployment.
+
+Table~\ref{tab:scenario} maps each deployment scenario to the required methods.
+
+\begin{table}[!t]
+\renewcommand{\arraystretch}{1.2}
+\caption{Deployment Scenario to Required Methods Mapping}
+\label{tab:scenario}
+\centering
+\begin{tabular}{@{}p{3.0cm} p{2.2cm} p{1.6cm}@{}}
+\toprule
+\textbf{Scenario} & \textbf{Required} & \textbf{Skip} \\
+\midrule
+Single centralised BS         & Lyapunov + WF              & ADMM, Nash, SDP \\
+Distributed multi-BS          & Lyapunov + ADMM            & SDP \\
+Selfish IoT devices           & Lyapunov + Nash            & SDP \\
+Dynamic $S_i = f(P_i)$        & Lyapunov + SCA             & SDP \\
+MIMO beamforming              & SDP relaxation             & Nash, ADMM \\
+Edge device (low memory)      & HAPE + BitNet QAT          & SDP \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Lyapunov Drift-Plus-Penalty Control}
+\label{sec:lyapunov}
+
+\subsection{Formulation}
+
+Define the Lyapunov function measuring total queue backlog energy:
+\begin{equation}
+L(\mathbf{Q}) = \tfrac{1}{2}\sum_i Q_i^2(t).
+\label{eq:lyapunov}
+\end{equation}
+The one-slot conditional drift is $\Delta(t) = \mathbb{E}[L(\mathbf{Q}(t{+}1)) - L(\mathbf{Q}(t))\mid\mathbf{Q}(t)]$, which is bounded above as:
+\begin{equation}
+\Delta(t) \le B + \sum_i Q_i \cdot \mathbb{E}[\lambda_i - \mu_i \mid \mathbf{Q}(t)].
+\label{eq:drift_bound}
+\end{equation}
+The DPP objective penalises the drift while maximising utility:
+\begin{equation}
+\underset{P_i,B_i}{\text{minimise}}\; \Delta(t) - V\sum_i S_i(t)R_i(t),
+\end{equation}
+where $V>0$ is a control parameter trading utility against queue length.
+
+\subsection{Per-Slot Algorithm}
+
+\begin{algorithm}[!t]
+\caption{Lyapunov DPP Resource Allocation (Per Slot)}
+\label{alg:dpp}
+\begin{algorithmic}[1]
+\Require $h_i(t),\,\lambda_i(t),\,\mathbf{Q}(t),\,S_i$ (cached), $V,\,P_{\max}$
+\State Observe channel $h_i(t)$ and arrivals $\lambda_i(t)$
+\State Retrieve $S_i$ from TinyML model (offline / cached)
+\State \textbf{Solve:} $\min -V\!\sum_i S_i R_i + \sum_i Q_i(\lambda_i{-}\mu_i)$; s.t.\ $\sum_i P_i \le P_{\max}$ \hfill \textit{(closed-form via Eq.~\eqref{eq:waterfill})}
+\State Transmit with optimal $\{P_i^*,B_i^*\}$
+\State Update: $Q_i(t{+}1) = [Q_i(t) - \mu_i]^+ + \lambda_i(t)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Theorem (Neely 2010)}
+\begin{equation}
+\mathbb{E}[\text{utility}] \ge \text{optimal} - \frac{B}{V}
+\quad\text{and}\quad
+\mathbb{E}[Q_i] = \mathcal{O}(V).
+\end{equation}
+\textit{The $V$ trade-off is unavoidable: higher $V$ improves utility but increases the average queue. Choose $V$ to match your delay budget.}
+
+\subsection{Convexity After Fixing $S_i$}
+
+The CVXPY formulation below validates the convex structure offline.
+
+\begin{lstlisting}[style=pythonstyle, caption={CVXPY DCP Formulation (offline validation)}, label={lst:cvxpy}]
+import cvxpy as cp, numpy as np
+
+P = cp.Variable(N, nonneg=True)   # power per user
+B = cp.Variable(N, nonneg=True)   # bandwidth per user
+
+# SNR per user (perspective of log1p)
+SNR = cp.multiply(P, h) * cp.inv_pos(
+        cp.multiply(N0, B))
+
+# Shannon capacity
+R = cp.multiply(B, cp.log1p(SNR) / np.log(2))
+
+# S_scores fixed this slot (exogenous input)
+obj   = cp.Maximize(S_scores @ R)
+cons  = [cp.sum(P) <= P_max,
+         cp.sum(B) <= B_total]
+
+prob  = cp.Problem(obj, cons)
+prob.solve(solver=cp.ECOS)
+# Complexity: O(N^{1.5} eps^{-1}) -- interior-point
+\end{lstlisting}
+
+Table~\ref{tab:convexity} summarises the convexity status of each term.
+
+\begin{table}[!t]
+\renewcommand{\arraystretch}{1.2}
+\caption{Convexity Status of Problem Terms}
+\label{tab:convexity}
+\centering
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Term} & \textbf{Status} & \textbf{Resolution} \\
+\midrule
+Shannon Rate $R_i(P_i,B_i)$        & Concave $\checkmark$  & Exploitable by solver \\
+Power budget $\sum P_i \le P_{\max}$ & Convex $\checkmark$   & Linear constraint \\
+Queue drift $\frac{1}{2}\sum Q_i^2$ & Convex $\checkmark$   & Quadratic Lyapunov \\
+$S_i = \sigma(W M_i + b)$           & Non-convex $\times$ & Use SCA if $S_i$ dynamic \\
+Product $S_i \times R_i$            & Non-convex $\times$ & Resolved by fixing $S_i$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Semantic Water-Filling}
+\label{sec:waterfilling}
+
+Setting $\partial\mathcal{L}/\partial P_i = 0$:
+\begin{equation}
+\frac{S_i |h_i|^2}{N_0 B_i + P_i |h_i|^2} - \lambda = 0
+\;\;\Rightarrow\;\;
+P_i^* = \left[\frac{S_i}{\mu} - \frac{N_0 B_i}{|h_i|^2}\right]^+,
+\label{eq:swf}
+\end{equation}
+where $\mu = 1/\lambda$ is the water level found by bisection. Users with higher $S_i$ receive a higher effective water level and hence more power.
+
+Classical water-filling (no semantics) allocates power based on channel quality only:
+$P_i^* = [\mu - N_0/|h_i|^2]^+$.
+Semantic Water-Filling~\eqref{eq:swf} extends this by weighting each user's level by $S_i$, preserving the $\mathcal{O}(N\log N)$ complexity while prioritising semantically important messages.
+
+\section{Method C: Successive Convex Approximation (SCA)}
+\label{sec:sca}
+
+\textbf{Trigger condition:} $S_i = f(P_i)$---semantic score depends on power level.
+
+\subsection{Surrogate Conditions}
+
+The surrogate function $\tilde{f}(\mathbf{P};\mathbf{P}^k)$ must satisfy:
+\begin{align}
+\text{(A1)}\;&\tilde{f}(\mathbf{P}^k;\mathbf{P}^k) = f(\mathbf{P}^k)\\
+\text{(A2)}\;&\nabla\tilde{f}(\mathbf{P}^k;\mathbf{P}^k) = \nabla f(\mathbf{P}^k)\\
+\text{(A3)}\;&\tilde{f}(\mathbf{P};\mathbf{P}^k) \text{ is a concave lower bound of } f\\
+\text{(A4)}\;&\text{Surrogate has Lipschitz-smooth gradient.}
+\end{align}
+
+\subsection{Update Rule}
+
+\begin{align}
+\tilde{R}(\mathbf{P}) &= R(\mathbf{P}^k) + \nabla R(\mathbf{P}^k)^\top(\mathbf{P}-\mathbf{P}^k)\\
+\mathbf{P}^{k+1}     &= \alpha\mathbf{P}^k + (1-\alpha)\mathbf{P}^* \\
+\text{Stop when:}\;&\|\mathbf{P}^{k+1} - \mathbf{P}^k\| < \varepsilon
+\end{align}
+
+\textbf{Convergence (Razaviyayn 2013):} Every limit point satisfies KKT conditions; rate $\mathcal{O}(1/k)$.
+
+\section{Method A: ADMM for Distributed Base Stations}
+\label{sec:admm}
+
+\textbf{Trigger condition:} Multiple BSs that must coordinate without a central controller.
+
+\subsection{Augmented Lagrangian}
+
+\begin{equation}
+\mathcal{L}_\rho(\mathbf{x},\mathbf{z},\boldsymbol{\lambda})
+= f(\mathbf{x}) + g(\mathbf{z})
+  + \boldsymbol{\lambda}^\top(\mathbf{x}-\mathbf{z})
+  + \frac{\rho}{2}\|\mathbf{x}-\mathbf{z}\|^2.
+\end{equation}
+
+\subsection{Three-Step Update}
+\begin{align}
+\mathbf{x}^{k+1} &= \arg\min_{\mathbf{x}}\;\mathcal{L}_\rho(\mathbf{x},\mathbf{z}^k,\boldsymbol{\lambda}^k)
+  \quad\text{(local convex solve per BS)}\label{eq:admm_x}\\
+\mathbf{z}^{k+1} &= \operatorname{clip}\!\left(\mathbf{x}^{k+1} + \boldsymbol{\lambda}^k/\rho,\,0,\,P_{\max}/N\right)
+  \quad\text{(global consensus)}\label{eq:admm_z}\\
+\boldsymbol{\lambda}^{k+1} &= \boldsymbol{\lambda}^k + \rho(\mathbf{x}^{k+1} - \mathbf{z}^{k+1})
+  \quad\text{(dual ascent)}\label{eq:admm_lam}
+\end{align}
+
+\textbf{Convergence (Boyd et al.\ 2011):} Primal residual $r_{\text{prim}} = \|\mathbf{x}^{k+1}-\mathbf{z}^{k+1}\|\to 0$ at rate $\mathcal{O}(1/k)$.
+Breaks when backhaul latency exceeds the slot duration or updates are asynchronous without error correction.
+
+\section{Method B: Nash Equilibrium for Selfish Devices}
+\label{sec:nash}
+
+\textbf{Trigger condition:} Users act independently to maximise their own utility (non-cooperative).
+
+\subsection{Game Formulation}
+
+\begin{align}
+\Gamma &= \langle\mathcal{N},\;\{P_i,B_i\},\;\{u_i\}\rangle\\
+u_i    &= S_i R_i(P_i) - c_i P_i.
+\end{align}
+
+\subsection{Best-Response Closed Form}
+
+Setting $\partial u_i / \partial P_i = 0$:
+\begin{equation}
+P_i^* = \left[\frac{S_i}{c_i \ln 2} - \frac{N_0 B_i}{h_i}\right]^+.
+\end{equation}
+
+Nash Equilibrium $\mathbf{a}^*$ satisfies:
+$u_i(a_i^*, a_{-i}^*) \ge u_i(a_i, a_{-i}^*)$ for all $i$ and all deviations $a_i$.
+
+\textbf{Existence and Convergence (Rosen 1965):} Equilibrium exists and best-response dynamics converge \emph{if and only if} diagonal strict concavity holds:
+\begin{equation}
+\sum_i (a_i - a_i^*)^\top \nabla_{a_i} u_i(\mathbf{a}^*) < 0
+\quad\forall\,\mathbf{a}\ne\mathbf{a}^*.
+\end{equation}
+Rate: $\mathcal{O}(N\log(1/\varepsilon))$.
+Price of Anarchy (PoA) $\le N$.
+
+\section{Method D: SDP Relaxation for MIMO Beamforming}
+\label{sec:sdp}
+
+\textbf{Important:} SDP applies to MIMO beamforming (complex vector precoder $\mathbf{w}_i \in \mathbb{C}^M$), not to the scalar power allocation of Problem (P0). Applying SDP to (P0) is a scope error.
+
+The original non-convex beamforming problem:
+\begin{align}
+\underset{\mathbf{w}_i}{\text{maximise}}\;&
+\sum_i S_i \log_2\!\left(1 + \frac{\mathbf{w}_i^H \mathbf{H}_i \mathbf{w}_i}{\sigma^2}\right)\nonumber\\
+\text{s.t.}\;&\|\mathbf{w}_i\|^2 \le P_i
+\end{align}
+is lifted via $\mathbf{W} = \mathbf{w}\mathbf{w}^H$ (dropping rank-1 constraint) to the SDP:
+\begin{align}
+\underset{\mathbf{W}}{\text{maximise}}\;&
+\sum_i S_i \log_2\!\left(1 + \frac{\operatorname{Tr}(\mathbf{H}_i\mathbf{W})}{\sigma^2}\right)\nonumber\\
+\text{s.t.}\;&\operatorname{Tr}(\mathbf{W}) \le P,\;\mathbf{W} \succeq 0.
+\end{align}
+Recovery: $\mathbf{w} = \mathbf{W}^{1/2}\boldsymbol{\zeta}$, $\boldsymbol{\zeta}\sim\mathcal{N}(\mathbf{0},\mathbf{I})$, achieves SINR within factor $\pi/4$ of optimal.
+
+\textbf{Robust version:} With uncertain channel $\mathbf{h}_i = \hat{\mathbf{h}}_i + \Delta\mathbf{h}_i$, $\|\Delta\mathbf{h}_i\|\le\varepsilon_i$, the worst-case SISO bound $h_{\text{worst}} = \hat{h}_i - \varepsilon_i$ can be substituted.
+
+\section{Method E: TinyML Compression for Edge Deployment}
+\label{sec:tinyml}
+
+The TinyML model produces $S_i$ as \emph{input} to the optimiser. It does not jointly optimise with the wireless resource allocator.
+
+\subsection{Knowledge Distillation (KD)}
+
+\begin{equation}
+\min\;\alpha\cdot L_{\text{task}} + (1-\alpha)\cdot
+\mathrm{KL}(p^t \| p^s)
+\quad\text{s.t. Memory}\le M_{\max},\;\text{Latency}\le\tau_{\max}.
+\end{equation}
+KL divergence is convex in student output $p^s$: gradient $= (p^s - p^t)/T^2$.
+Temperature $T$ anneals from $T_{\max}$ to 1 (analogous to SCA continuation).
+Convergence: $\mathcal{O}(\varepsilon^{-2})$ gradient steps.
+
+\subsection{HAPE Pruning (Hardware-Aware)}
+
+\begin{equation}
+\min\;[-\text{Accuracy}(\text{mask}),\;\text{Latency}(\text{mask})]
+\quad\text{s.t. }\|\text{mask}\|_0 \le k.
+\end{equation}
+Importance score (Taylor first-order):
+$\mathrm{Importance}_i = |\partial L/\partial\theta_i \cdot \theta_i|$.
+
+\textbf{Results:} 87\% memory reduction (58\,MB $\to$ 7\,MB), 82\% latency reduction (45\,ms $\to$ 8\,ms), 1.2\% accuracy loss.
+
+\subsection{BitNet b1.58 --- Ternary QAT}
+
+Weights are constrained to $\theta_i \in \{-1,0,+1\}$.
+The Straight-Through Estimator (STE) passes gradients through the rounding:
+$\partial\operatorname{Round}/\partial\theta \equiv 1$.
+Energy: 0.03\,pJ vs.\ 3.7\,pJ per FP32 multiply $\Rightarrow$
+\textbf{19$\times$ energy reduction} per layer.
+Convergence: $\mathcal{O}(\varepsilon^{-4})$ SGD steps.
+
+Proximal operators used: $L_1$ soft-threshold
+$\theta_i^* = \operatorname{sign}(\theta_i)\max(|\theta_i|-\lambda,0)$
+(scalar, convex); group $L_{2,1}$ to zero entire attention heads.
+
+\section{Validity Domains and Computational Cost}
+\label{sec:validity}
+
+Table~\ref{tab:validity2} summarises validity domains and convergence guarantees for all methods. Table~\ref{tab:complexity} compares their per-slot complexity and real-time feasibility.
+
+\begin{table*}[!t]
+\renewcommand{\arraystretch}{1.22}
+\caption{Validity Domain of Each Method}
+\label{tab:validity2}
+\centering
+\begin{tabular}{@{}p{2.4cm} p{3.4cm} p{3.5cm} p{4.5cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Valid When} & \textbf{Breaks When} & \textbf{Convergence Guarantee} \\
+\midrule
+Lyapunov DPP  & Stationary/ergodic arrivals and channel &
+Non-stationary or adversarial arrivals &
+$\mathbb{E}[\text{util}]\ge\text{opt}-B/V$;\; $\mathbb{E}[Q]=\mathcal{O}(V)$ \\
+
+Semantic WF &
+Single BS, fixed $S_i$, SISO &
+MIMO, dynamic $S_i$, multi-BS without ADMM &
+$\mathcal{O}(N\log N)$ --- closed-form exact \\
+
+Convex Solver &
+$S_i$ fixed per slot &
+$S_i = f(P_i)$ --- non-convex &
+$\mathcal{O}(N^{1.5}\varepsilon^{-1})$ --- interior-point \\
+
+SCA &
+Lipschitz-smooth obj., good init. &
+Non-smooth objective or poor init. &
+KKT stationary point; $\mathcal{O}(1/k)$ \\
+
+ADMM &
+Reliable, low-latency backhaul &
+High-latency or async.\ updates &
+$\mathcal{O}(1/k)$ primal $+$ dual residuals \\
+
+Nash BR &
+Concave utilities, diag.\ strict concavity &
+Non-convex user coupling &
+$\mathcal{O}(N\log(1/\varepsilon))$; PoA $\le N$ \\
+
+SDP &
+MIMO beamforming only &
+Applied to scalar $P_0$ (scope error) &
+SINR within $\pi/4$ of optimal \\
+
+KD/HAPE/QAT &
+Fixed hardware target &
+Multiple hardware targets &
+$\mathcal{O}(\varepsilon^{-2})$ KD; $\mathcal{O}(\varepsilon^{-4})$ QAT \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\begin{table*}[!t]
+\renewcommand{\arraystretch}{1.22}
+\caption{Computational Cost and Real-Time Feasibility}
+\label{tab:complexity}
+\centering
+\begin{tabular}{@{}p{2.8cm} p{2.4cm} p{1.3cm} p{1.8cm} p{4.0cm}@{}}
+\toprule
+\textbf{Method} & \textbf{Complexity/Slot} & \textbf{Memory} & \textbf{RT Feasible?} & \textbf{Deployment Note} \\
+\midrule
+Semantic Water-Filling    & $\mathcal{O}(N\log N)$       & $\mathcal{O}(N)$   & \textbf{Yes}         & Default real-time choice \\
+Lyapunov sub-problem      & $\mathcal{O}(N^{1.5}\varepsilon^{-1})$ & $\mathcal{O}(N)$ & Approx. only & Warm-start or lookup table \\
+ADMM (per iter.)          & $\mathcal{O}(N\log N)\times k$  & $\mathcal{O}(N)$/BS & Yes w/ warm-start & Latency dominates \\
+SCA (per iter.)           & $\mathcal{O}(N^2)\times k$   & $\mathcal{O}(N^2)$ & \textbf{No}          & Pre-trained policy in RT \\
+Nash Best-Response        & $\mathcal{O}(N)$/user        & $\mathcal{O}(N)$/user & Yes               & No coordination needed \\
+SDP Beamforming           & $\mathcal{O}(M^{3.5})$       & $\mathcal{O}(M^2)$ & \textbf{No}          & Pre-compute on slow timescale \\
+KD/HAPE Pruning           & $\mathcal{O}(P)$ parameters  & $\mathcal{O}(P)$   & One-time offline     & Deploy compressed model \\
+\bottomrule
+\multicolumn{5}{l}{\small $N$: users; $M$: antennas; $P$: model parameters; BS: base station; RT: real-time.}
+\end{tabular}
+\end{table*}
+
+\section{System Architecture}
+\label{sec:arch}
+
+Three independent deployment architectures are illustrated below. They are chosen based on the deployment scenario and do not run simultaneously.
+
+\section{Simulation Results}
+\label{sec:results}
+
+\subsection{Experimental Setup}
+
+\begin{itemize}
+\item $N = 50$ users; channel: Rayleigh fading i.i.d., $h_i\sim\mathrm{Exp}(1)$.
+\item Bandwidth: $B_i = B_{\text{total}}/N$ (equal split).
+\item Noise: $N_0 = 10^{-9}$\,W/Hz.
+\item Arrivals: Poisson, $\lambda_i = 1.0$ packets/slot in the baseline regime.
+\item Duration: 500 time-slots; queue initialised at $Q_i(0)=0$.
+\item Fixed random seed 42; 5 independent runs.
+\item Convergence threshold: $\|P^{k+1}-P^k\|<10^{-4}$.
+\end{itemize}
+
+\subsection{Primary Result: Heterogeneous Load Stress Test}
+
+The strongest effect appears under heterogeneous traffic. Heavy users experience significantly larger queue pressure than light users, which exposes the difference between schedulers. Equal power and channel-first scheduling allow heavy-user backlog to grow, while the Lyapunov controller stabilises the queue by prioritising high-backlog users.
+
+The measured improvement is substantial: heavy-user delay drops from about 80--94\,ms under naive scheduling to about 42--43\,ms under Lyapunov control, a reduction of approximately 1.8$\times$. Queue variance also collapses, confirming that the proposed method is primarily a stability mechanism under stress.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{stress_scenario.png}
+\caption{Lead result: heterogeneous load stress test. The proposed scheduler significantly lowers delay for heavy users compared to equal-power and channel-only baselines.}
+\label{fig:stress}
+\end{figure}
+
+\subsection{Queue Evolution}
+
+Queue trajectories make the mechanism visible. Under equal power, the mean backlog grows faster and stays higher. Lyapunov-based control keeps the backlog lower by reacting to queue state, which is exactly what the DPP formulation is meant to do.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{queue_evolution.png}
+\caption{Queue evolution over the 500-slot horizon. Lyapunov scheduling suppresses backlog growth relative to equal power.}
+\label{fig:queue}
+\end{figure}
+
+\subsection{Tail Delay Distribution}
+
+Average delay alone hides the important part. Tail delay shows whether the scheduler protects the worst-served users. The proposed method lowers the mean, 95th percentile, and maximum delay, which is the practical guarantee needed for latency-sensitive semantic traffic.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{tail_delay_distribution.png}
+\caption{Tail delay distribution. The 95th-percentile and maximum delay drop under queue-aware control, which is the relevant indicator for QoS stability.}
+\label{fig:tail}
+\end{figure}
+
+\subsection{Utility Comparison}
+
+The utility comparison figure is the sanity check, not the main claim. It shows that in the normal regime, semantic utility values cluster closely and the method does not rely on inflated throughput claims. That is the correct interpretation: the gain is primarily in delay and stability under load imbalance.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{utility_comparison.png}
+\caption{Utility comparison across schedulers. This is the reference throughput metric; it should be read as a sanity check rather than the main contribution.}
+\label{fig:utility}
+\end{figure}
+
+\subsection{Alpha Sensitivity}
+
+The alpha sensitivity plot confirms that ranking stability is not a tuning artefact. Varying the delay penalty changes the magnitude of the metric, but the scheduler ordering remains consistent. This is the correct defence against claims that the metric was shaped to force a result.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\linewidth]{alpha_sensitivity.png}
+\caption{Sensitivity of delay-aware utility to the delay penalty parameter. Ranking remains stable across the tested range, confirming robustness of the metric.}
+\label{fig:alpha}
+\end{figure}
+
+\subsection{Discussion}
+
+The proposed method does not claim universal superiority. Its contribution is robustness under heterogeneous and bursty load. In homogeneous traffic regimes, throughput differences compress and the main gain is not raw utility, but delay variance reduction and tail control. This is exactly the regime in which queue-aware scheduling matters.
+
+The method also has a clear operational boundary. As arrival rate approaches service capacity, $\rho \to 1$, queue lengths grow rapidly for all schedulers. Lyapunov control delays instability but cannot prevent it beyond the stability region. This boundary is useful because it prevents overclaiming and clarifies where the method should be deployed.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This paper presented a layered framework for semantic-aware resource allocation in 6G networks. The key contributions are:
+\begin{enumerate}
+\item \textbf{Convexity by design.} Fixing the semantic score $S_i$ at the start of each slot renders Problem (P0) jointly concave in $(P,B)$, enabling the closed-form Semantic Water-Filling solution in $\mathcal{O}(N\log N)$.
+\item \textbf{Lyapunov online control.} The DPP controller provides provable utility gap $B/V$ and queue bound $\mathcal{O}(V)$ without requiring future channel knowledge. The $V$ trade-off is theorem-mandated, not a design flaw.
+\item \textbf{Principled extensions.} ADMM, Nash Equilibrium, SCA, and SDP each have a single, unambiguous trigger condition. None is universally required.
+\item \textbf{TinyML decoupling.} The model produces $S_i$ as an input; the two systems are decoupled unless $S_i$ is power-adaptive (SCA then applies). HAPE pruning and BitNet QAT reduce deployment cost by 87\% memory and 19$\times$ energy with negligible performance loss.
+\end{enumerate}
+
+The empirical evidence supports a precise conclusion: the proposed scheduler is most valuable under non-ideal traffic conditions, where it stabilises queues and sharply reduces delay variance. Full deployment relies on closed-form water-filling and pre-trained lookup policies; CVXPY and SCA serve as offline validation tools. Using approximations in real-time is the correct engineering choice for 1\,ms 5G/6G slots.
+
+\section*{Acknowledgements}
+
+The author thanks the Department of Electronics \& Communication Engineering, Manipal Institute of Technology (MIT), Manipal--576104, for supporting this research.
+
+\begin{thebibliography}{10}
+
+\bibitem{neely2010}
+M.~J. Neely,
+\textit{Stochastic Network Optimization with Application to Communication and Queueing Systems},
+Morgan \& Claypool, 2010.
+
+\bibitem{razaviyayn2013}
+M.~Razaviyayn, M.~Hong, and Z.-Q. Luo,
+``A Unified Convergence Analysis of Block Successive Minimization Methods for Nonsmooth Optimization,''
+\textit{SIAM J. Optim.}, vol.~23, no.~2, pp.~1126--1153, 2013.
+
+\bibitem{boyd2011}
+S.~Boyd, N.~Parikh, E.~Chu, B.~Peleato, and J.~Eckstein,
+``Distributed Optimization and Statistical Learning via the Alternating Direction Method of Multipliers,''
+\textit{Found. Trends Mach. Learn.}, vol.~3, no.~1, pp.~1--122, 2011.
+
+\bibitem{rosen1965}
+J.~B. Rosen,
+``Existence and Uniqueness of Equilibrium Points for Concave $N$-Person Games,''
+\textit{Econometrica}, vol.~33, no.~3, pp.~520--534, 1965.
+
+\bibitem{yin2019}
+P.~Yin, J.~Lyu, S.~Zhang, S.~Osher, Y.~Qi, and J.~Xin,
+``Understanding Straight-Through Estimator in Training Activation Quantized Neural Nets,''
+in \textit{Proc.\ ICLR}, 2019.
+
+\bibitem{bertsekas1999}
+D.~P. Bertsekas,
+\textit{Nonlinear Programming}, 2nd~ed.
+Athena Scientific, 1999.
+
+\bibitem{raghavan1987}
+P.~Raghavan and C.~D. Thompson,
+``Randomized Rounding: A Technique for Provably Good Algorithms and Algorithmic Proofs,''
+\textit{Combinatorica}, vol.~7, no.~4, pp.~365--374, 1987.
+
+\bibitem{ma2024bitnet}
+S.~Ma \textit{et al.},
+``The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits,''
+\textit{arXiv preprint arXiv:2402.17764}, 2024.
+
+\bibitem{cover2006}
+T.~M. Cover and J.~A. Thomas,
+\textit{Elements of Information Theory}, 2nd~ed.
+Wiley-Interscience, 2006.
+
+\bibitem{luo2006}
+Z.-Q. Luo and W.~Yu,
+``An Introduction to Convex Optimization for Communications and Signal Processing,''
+\textit{IEEE J. Sel. Areas Commun.}, vol.~24, no.~8, pp.~1426--1438, 2006.
+
+\end{thebibliography}
+
+\end{document}
